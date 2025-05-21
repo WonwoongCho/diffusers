@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
+
 from transformers import (
     CLIPImageProcessor,
     CLIPTextModel,
@@ -41,7 +42,6 @@ from ...utils import (
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline
 from .pipeline_output import FluxPipelineOutput
-
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
@@ -208,7 +208,18 @@ class FluxPipeline(
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         # Flux latents are turned into 2x2 patches and packed. This means the latent width and height has to be divisible
         # by the patch size. So the vae scale factor is multiplied by the patch size to account for this
+        self.latent_channels = self.vae.config.latent_channels if getattr(self, "vae", None) else 16
+
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
+
+        self.mask_processor = VaeImageProcessor(
+            vae_scale_factor=self.vae_scale_factor * 2,
+            vae_latent_channels=self.latent_channels,
+            do_normalize=False,
+            do_binarize=True,
+            do_convert_grayscale=True,
+        )
+
         self.tokenizer_max_length = (
             self.tokenizer.model_max_length if hasattr(self, "tokenizer") and self.tokenizer is not None else 77
         )
@@ -397,6 +408,37 @@ class FluxPipeline(
         image_embeds = image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
         return image_embeds
 
+    def retrieve_latents(
+        self, encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "sample"
+    ):
+        if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
+            return encoder_output.latent_dist.sample(generator)
+        elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
+            return encoder_output.latent_dist.mode()
+        elif hasattr(encoder_output, "latents"):
+            return encoder_output.latents
+        else:
+            raise AttributeError("Could not access latents of provided encoder_output")
+
+
+    def encode_image_vae(self, img, device, weight_dtype, generator=None):
+        # img = c_crop(img)
+        # img = img.resize((self.img_size, self.img_size))
+        # img = torch.from_numpy((np.array(img) / 127.5) - 1)
+        # img = img.permute(2, 0, 1)
+        # img = img.unsqueeze(0)
+        from torchvision import transforms as tfms
+        img = tfms.functional.to_tensor(img).unsqueeze(0).to(device) * 2 - 1
+        
+        x_latent = self.retrieve_latents(self.vae.encode(img.to(device=device, dtype=weight_dtype)), generator=generator)
+        x_latent = (x_latent - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+        _, c, h, w = x_latent.shape
+        # if bs == 1 and not isinstance(prompt, str):
+        #     bs = len(prompt)
+        from einops import rearrange, repeat
+        x_latent = rearrange(x_latent, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+        return x_latent
+
     def prepare_ip_adapter_image_embeds(
         self, ip_adapter_image, ip_adapter_image_embeds, device, num_images_per_prompt
     ):
@@ -489,6 +531,14 @@ class FluxPipeline(
                 f"Cannot forward both `negative_prompt_2`: {negative_prompt_2} and `negative_prompt_embeds`:"
                 f" {negative_prompt_embeds}. Please make sure to only forward one of the two."
             )
+
+        if prompt_embeds is not None and negative_prompt_embeds is not None:
+            if prompt_embeds.shape != negative_prompt_embeds.shape:
+                raise ValueError(
+                    "`prompt_embeds` and `negative_prompt_embeds` must have the same shape when passed directly, but"
+                    f" got: `prompt_embeds` {prompt_embeds.shape} != `negative_prompt_embeds`"
+                    f" {negative_prompt_embeds.shape}."
+                )
 
         if prompt_embeds is not None and pooled_prompt_embeds is None:
             raise ValueError(
@@ -604,6 +654,52 @@ class FluxPipeline(
 
         return latents, latent_image_ids
 
+    def prepare_mask_latents(
+        self,
+        mask,
+        batch_size,
+        num_channels_latents,
+        num_images_per_prompt,
+        height,
+        width,
+        dtype,
+        device,
+        generator,
+    ):
+        # VAE applies 8x compression on images but we must also account for packing which requires
+        # latent height and width to be divisible by 2.
+        height = 2 * (int(height) // (self.vae_scale_factor * 2))
+        width = 2 * (int(width) // (self.vae_scale_factor * 2))
+        # resize the mask to latents shape as we concatenate the mask to the latents
+        # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
+        # and half precision
+        mask = torch.nn.functional.interpolate(mask, size=(height, width))
+        mask = mask.to(device=device, dtype=dtype)
+
+        batch_size = batch_size * num_images_per_prompt
+
+        # duplicate mask and masked_image_latents for each generation per prompt, using mps friendly method
+        if mask.shape[0] < batch_size:
+            if not batch_size % mask.shape[0] == 0:
+                raise ValueError(
+                    "The passed mask and the required batch size don't match. Masks are supposed to be duplicated to"
+                    f" a total batch size of {batch_size}, but {mask.shape[0]} masks were passed. Make sure the number"
+                    " of masks that you pass is divisible by the total requested batch size."
+                )
+            mask = mask.repeat(batch_size // mask.shape[0], 1, 1, 1)
+
+        # aligning device to prevent device errors when concating it with the latent model input
+        
+        mask = self._pack_latents(
+            mask.repeat(1, num_channels_latents, 1, 1),
+            batch_size,
+            num_channels_latents,
+            height,
+            width,
+        )
+
+        return mask.mean(dim=2, keepdim=True)
+
     @property
     def guidance_scale(self):
         return self._guidance_scale
@@ -623,6 +719,12 @@ class FluxPipeline(
     @property
     def interrupt(self):
         return self._interrupt
+    
+    def repeat_on_batch(self, input_tensor, is_stack=False, num_repeat=2): # for it-blender input processing
+        if is_stack:
+            return torch.stack([input_tensor]*num_repeat, dim=0)
+        else:
+            return torch.cat([input_tensor]*num_repeat, dim=0)
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -655,6 +757,10 @@ class FluxPipeline(
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
+        it_blender_image: Optional[PipelineImageInput] = None,
+        reference_saliency_maps: Optional[PipelineImageInput] = None,
+        query_saliency_maps: Optional[PipelineImageInput] = None,
+        out_path=None # this is for saving SA mask
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -687,11 +793,11 @@ class FluxPipeline(
                 their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is passed
                 will be used.
             guidance_scale (`float`, *optional*, defaults to 3.5):
-                Guidance scale as defined in [Classifier-Free Diffusion
-                Guidance](https://huggingface.co/papers/2207.12598). `guidance_scale` is defined as `w` of equation 2.
-                of [Imagen Paper](https://huggingface.co/papers/2205.11487). Guidance scale is enabled by setting
-                `guidance_scale > 1`. Higher guidance scale encourages to generate images that are closely linked to
-                the text `prompt`, usually at the expense of lower image quality.
+                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
+                `guidance_scale` is defined as `w` of equation 2. of [Imagen
+                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
+                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
+                usually at the expense of lower image quality.
             num_images_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
             generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
@@ -813,7 +919,7 @@ class FluxPipeline(
             (
                 negative_prompt_embeds,
                 negative_pooled_prompt_embeds,
-                negative_text_ids,
+                _,
             ) = self.encode_prompt(
                 prompt=negative_prompt,
                 prompt_2=negative_prompt_2,
@@ -837,6 +943,42 @@ class FluxPipeline(
             generator,
             latents,
         )
+
+        if reference_saliency_maps is not None:
+            ref_mask_condition = self.mask_processor.preprocess(
+                reference_saliency_maps, height=height, width=width, resize_mode="default", crops_coords=None
+            )
+
+            ref_mask = self.prepare_mask_latents(
+                ref_mask_condition,
+                batch_size,
+                num_channels_latents,
+                num_images_per_prompt,
+                height,
+                width,
+                prompt_embeds.dtype,
+                device,
+                generator,
+            )
+        
+        if query_saliency_maps is not None:
+            query_mask_condition = self.mask_processor.preprocess(
+                query_saliency_maps, height=height, width=width, resize_mode="default", crops_coords=None
+            )
+
+            query_mask = self.prepare_mask_latents(
+                query_mask_condition,
+                batch_size,
+                num_channels_latents,
+                num_images_per_prompt,
+                height,
+                width,
+                prompt_embeds.dtype,
+                device,
+                generator,
+            )
+        
+
 
         # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
@@ -897,6 +1039,14 @@ class FluxPipeline(
                 batch_size * num_images_per_prompt,
             )
 
+        if it_blender_image is not None:
+            if isinstance(it_blender_image, list):
+                x_latent = torch.cat([self.encode_image_vae(each_ref_img, device, latents.dtype, generator=generator) for each_ref_img in it_blender_image], dim=0)
+            else:
+                x_latent = self.encode_image_vae(it_blender_image, device, latents.dtype, generator=generator)
+            num_ref = x_latent.size(0)
+            # assert x_latent.size() == latents.size(), "the image latent and the randomly sampled latent should have the same size to be concatenated."
+        # 6. Denoising loop
         # 6. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -906,35 +1056,63 @@ class FluxPipeline(
                 self._current_timestep = t
                 if image_embeds is not None:
                     self._joint_attention_kwargs["ip_adapter_image_embeds"] = image_embeds
+                if reference_saliency_maps is not None:
+                    self._joint_attention_kwargs["ref_mask"] = ref_mask
+                if query_saliency_maps is not None:
+                    self._joint_attention_kwargs["query_mask"] = query_mask
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-                noise_pred = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    pooled_projections=pooled_prompt_embeds,
-                    encoder_hidden_states=prompt_embeds,
-                    txt_ids=text_ids,
-                    img_ids=latent_image_ids,
-                    joint_attention_kwargs=self.joint_attention_kwargs,
-                    return_dict=False,
-                )[0]
-
-                if do_true_cfg:
-                    if negative_image_embeds is not None:
-                        self._joint_attention_kwargs["ip_adapter_image_embeds"] = negative_image_embeds
-                    neg_noise_pred = self.transformer(
+                if it_blender_image is not None:
+                    noise_pred = self.transformer(
+                        hidden_states=torch.cat([latents, x_latent], dim=0),
+                        timestep=torch.cat([timestep] + [torch.zeros_like(timestep)]*num_ref, dim=0) / 1000,
+                        guidance=self.repeat_on_batch(guidance, num_repeat=num_ref + 1),
+                        pooled_projections=self.repeat_on_batch(pooled_prompt_embeds, num_repeat=num_ref + 1),
+                        encoder_hidden_states=self.repeat_on_batch(prompt_embeds, num_repeat=num_ref + 1),
+                        txt_ids=text_ids,
+                        img_ids=latent_image_ids,
+                        joint_attention_kwargs=self.joint_attention_kwargs,
+                        return_dict=False,
+                    )[0][:batch_size]
+                    if out_path is not None:
+                        import os
+                        attention_masks_per_time_per_layer = {key: value.attention_mask for key, value in self.transformer.attn_processors.items() if "single" in key}                    
+                        torch.save(attention_masks_per_time_per_layer, os.path.join(out_path, f"attention_masks_t{i}.pt")) # this is huge!! 38 layes, 28 timesteps. Almost 50 GB
+                else:
+                    # raise ValueError("Nah")
+                    # not here
+                    noise_pred = self.transformer(
                         hidden_states=latents,
                         timestep=timestep / 1000,
                         guidance=guidance,
-                        pooled_projections=negative_pooled_prompt_embeds,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        txt_ids=negative_text_ids,
+                        pooled_projections=pooled_prompt_embeds,
+                        encoder_hidden_states=prompt_embeds,
+                        txt_ids=text_ids,
                         img_ids=latent_image_ids,
                         joint_attention_kwargs=self.joint_attention_kwargs,
                         return_dict=False,
                     )[0]
+
+                if do_true_cfg:
+                    # not here
+                    if negative_image_embeds is not None:
+                        self._joint_attention_kwargs["ip_adapter_image_embeds"] = negative_image_embeds
+                    
+                    self._joint_attention_kwargs["is_negative_prompt"] = True
+                
+                    neg_noise_pred = self.transformer(
+                        hidden_states=torch.cat([latents, x_latent], dim=0),
+                        timestep=torch.cat([timestep, torch.zeros_like(timestep)], dim=0) / 1000,
+                        guidance=self.repeat_on_batch(guidance),
+                        pooled_projections=self.repeat_on_batch(negative_pooled_prompt_embeds),
+                        encoder_hidden_states=self.repeat_on_batch(negative_prompt_embeds),
+                        txt_ids=text_ids,
+                        img_ids=latent_image_ids,
+                        joint_attention_kwargs=self.joint_attention_kwargs,
+                        return_dict=False,
+                        
+                    )[0][:batch_size]
                     noise_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
 
                 # compute the previous noisy sample x_t -> x_t-1
