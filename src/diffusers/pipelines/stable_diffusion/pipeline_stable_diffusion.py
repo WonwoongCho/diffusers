@@ -70,7 +70,7 @@ def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     r"""
     Rescales `noise_cfg` tensor based on `guidance_rescale` to improve image quality and fix overexposure. Based on
     Section 3.4 from [Common Diffusion Noise Schedules and Sample Steps are
-    Flawed](https://huggingface.co/papers/2305.08891).
+    Flawed](https://arxiv.org/pdf/2305.08891.pdf).
 
     Args:
         noise_cfg (`torch.Tensor`):
@@ -608,7 +608,7 @@ class StableDiffusionPipeline(
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
         # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
-        # eta corresponds to η in DDIM paper: https://huggingface.co/papers/2010.02502
+        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
         # and should be between [0, 1]
 
         accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
@@ -757,7 +757,7 @@ class StableDiffusionPipeline(
         return self._clip_skip
 
     # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-    # of the Imagen paper: https://huggingface.co/papers/2205.11487 . `guidance_scale = 1`
+    # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
     # corresponds to doing no classifier free guidance.
     @property
     def do_classifier_free_guidance(self):
@@ -836,8 +836,8 @@ class StableDiffusionPipeline(
             num_images_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
             eta (`float`, *optional*, defaults to 0.0):
-                Corresponds to parameter eta (η) from the [DDIM](https://huggingface.co/papers/2010.02502) paper. Only
-                applies to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
+                Corresponds to parameter eta (η) from the [DDIM](https://arxiv.org/abs/2010.02502) paper. Only applies
+                to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
             generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
                 A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
                 generation deterministic.
@@ -867,7 +867,7 @@ class StableDiffusionPipeline(
                 [`self.processor`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
             guidance_rescale (`float`, *optional*, defaults to 0.0):
                 Guidance rescale factor from [Common Diffusion Noise Schedules and Sample Steps are
-                Flawed](https://huggingface.co/papers/2305.08891). Guidance rescale factor should fix overexposure when
+                Flawed](https://arxiv.org/pdf/2305.08891.pdf). Guidance rescale factor should fix overexposure when
                 using zero terminal SNR.
             clip_skip (`int`, *optional*):
                 Number of layers to be skipped from CLIP while computing the prompt embeddings. A value of 1 means that
@@ -895,6 +895,12 @@ class StableDiffusionPipeline(
         callback = kwargs.pop("callback", None)
         callback_steps = kwargs.pop("callback_steps", None)
 
+        clean_image = kwargs.pop("clean_image", None)
+        # timesteps_ba = kwargs.pop("timesteps_ba", None)
+        start_end_layers = kwargs.pop("start_end_layers", None)
+        attention_mask = kwargs.pop("attention_mask", None)
+        fix_latents = kwargs.pop("fix_latents", False)
+        
         if callback is not None:
             deprecate(
                 "callback",
@@ -977,7 +983,9 @@ class StableDiffusionPipeline(
         # Here we concatenate the unconditional and text embeddings into a single batch
         # to avoid doing two forward passes
         if self.do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
+            # negative_prompt_embeds = negative_prompt_embeds.repeat(2,1,1)
+            # prompt_embeds = prompt_embeds.repeat(2,1,1)
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds]*2)
 
         if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
             image_embeds = self.prepare_ip_adapter_image_embeds(
@@ -1006,6 +1014,15 @@ class StableDiffusionPipeline(
             latents,
         )
 
+        if fix_latents:
+            latents = latents[0:1].repeat(latents.size(0),1,1,1)
+
+
+        clean_image = clean_image.unsqueeze(0).repeat(batch_size,1,1,1)
+        clean_latents = self.vae.encode(clean_image.to(device, dtype=latents.dtype)).latent_dist.sample()
+        clean_latents = clean_latents * self.vae.config.scaling_factor
+
+
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
@@ -1023,7 +1040,7 @@ class StableDiffusionPipeline(
             timestep_cond = self.get_guidance_scale_embedding(
                 guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
             ).to(device=device, dtype=latents.dtype)
-
+        
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
@@ -1031,29 +1048,41 @@ class StableDiffusionPipeline(
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
-
+                
+                
+                
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
+                clean_latent_model_input = torch.cat([clean_latents] * 2) if self.do_classifier_free_guidance else clean_latents
+                # clean_latent_model_input = self.scheduler.scale_model_input(clean_latent_model_input, 0)
+
+                time_tensor = torch.LongTensor([t]).to(latents.device).repeat(batch_size*2)
+                time_tensor = torch.cat([time_tensor, torch.zeros_like(time_tensor)], dim=0)
                 # predict the noise residual
+                # if self.cross_attention_kwargs is None:
+                #     self.cross_attention_kwargs = {"scale_for_ba": 1 if i >= start_timestep_ba else 0}
+                # else:
+                #     self.cross_attention_kwargs["scale_for_ba"] = 1 if i >= start_timestep_ba else 0
                 noise_pred = self.unet(
-                    latent_model_input,
-                    t,
+                    torch.cat([latent_model_input,clean_latent_model_input], dim=0),
+                    time_tensor,
                     encoder_hidden_states=prompt_embeds,
                     timestep_cond=timestep_cond,
-                    cross_attention_kwargs=self.cross_attention_kwargs,
+                    cross_attention_kwargs={"sampling_iter": i}, # self.cross_attention_kwargs, # {"start_end_layers": start_end_layers}, # {"scale_for_ba": 0.5 if i >= timesteps_ba[0] and i < timesteps_ba[1] else 0}, # 
                     added_cond_kwargs=added_cond_kwargs,
                     return_dict=False,
-                )[0]
-
+                    attention_mask=attention_mask
+                )[0][:batch_size*2]
+                
                 # perform guidance
                 if self.do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                 if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
-                    # Based on 3.4. in https://huggingface.co/papers/2305.08891
+                    # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
                     noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
 
                 # compute the previous noisy sample x_t -> x_t-1
