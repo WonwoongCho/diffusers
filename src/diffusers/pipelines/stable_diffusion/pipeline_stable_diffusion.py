@@ -1060,17 +1060,14 @@ class StableDiffusionPipeline(
 
                 time_tensor = torch.LongTensor([t]).to(latents.device).repeat(batch_size*2)
                 time_tensor = torch.cat([time_tensor, torch.zeros_like(time_tensor)], dim=0)
+                
                 # predict the noise residual
-                # if self.cross_attention_kwargs is None:
-                #     self.cross_attention_kwargs = {"scale_for_ba": 1 if i >= start_timestep_ba else 0}
-                # else:
-                #     self.cross_attention_kwargs["scale_for_ba"] = 1 if i >= start_timestep_ba else 0
                 noise_pred = self.unet(
                     torch.cat([latent_model_input,clean_latent_model_input], dim=0),
                     time_tensor,
                     encoder_hidden_states=prompt_embeds,
                     timestep_cond=timestep_cond,
-                    cross_attention_kwargs={"sampling_iter": i}, # self.cross_attention_kwargs, # {"start_end_layers": start_end_layers}, # {"scale_for_ba": 0.5 if i >= timesteps_ba[0] and i < timesteps_ba[1] else 0}, # 
+                    cross_attention_kwargs= {},
                     added_cond_kwargs=added_cond_kwargs,
                     return_dict=False,
                     attention_mask=attention_mask
