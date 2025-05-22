@@ -896,8 +896,6 @@ class StableDiffusionPipeline(
         callback_steps = kwargs.pop("callback_steps", None)
 
         clean_image = kwargs.pop("clean_image", None)
-        # timesteps_ba = kwargs.pop("timesteps_ba", None)
-        start_end_layers = kwargs.pop("start_end_layers", None)
         attention_mask = kwargs.pop("attention_mask", None)
         fix_latents = kwargs.pop("fix_latents", False)
         
