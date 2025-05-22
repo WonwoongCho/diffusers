@@ -758,9 +758,6 @@ class FluxPipeline(
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
         it_blender_image: Optional[PipelineImageInput] = None,
-        reference_saliency_maps: Optional[PipelineImageInput] = None,
-        query_saliency_maps: Optional[PipelineImageInput] = None,
-        out_path=None # this is for saving SA mask
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -944,41 +941,6 @@ class FluxPipeline(
             latents,
         )
 
-        if reference_saliency_maps is not None:
-            ref_mask_condition = self.mask_processor.preprocess(
-                reference_saliency_maps, height=height, width=width, resize_mode="default", crops_coords=None
-            )
-
-            ref_mask = self.prepare_mask_latents(
-                ref_mask_condition,
-                batch_size,
-                num_channels_latents,
-                num_images_per_prompt,
-                height,
-                width,
-                prompt_embeds.dtype,
-                device,
-                generator,
-            )
-        
-        if query_saliency_maps is not None:
-            query_mask_condition = self.mask_processor.preprocess(
-                query_saliency_maps, height=height, width=width, resize_mode="default", crops_coords=None
-            )
-
-            query_mask = self.prepare_mask_latents(
-                query_mask_condition,
-                batch_size,
-                num_channels_latents,
-                num_images_per_prompt,
-                height,
-                width,
-                prompt_embeds.dtype,
-                device,
-                generator,
-            )
-        
-
 
         # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
@@ -1056,10 +1018,6 @@ class FluxPipeline(
                 self._current_timestep = t
                 if image_embeds is not None:
                     self._joint_attention_kwargs["ip_adapter_image_embeds"] = image_embeds
-                if reference_saliency_maps is not None:
-                    self._joint_attention_kwargs["ref_mask"] = ref_mask
-                if query_saliency_maps is not None:
-                    self._joint_attention_kwargs["query_mask"] = query_mask
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
@@ -1075,10 +1033,7 @@ class FluxPipeline(
                         joint_attention_kwargs=self.joint_attention_kwargs,
                         return_dict=False,
                     )[0][:batch_size]
-                    if out_path is not None:
-                        import os
-                        attention_masks_per_time_per_layer = {key: value.attention_mask for key, value in self.transformer.attn_processors.items() if "single" in key}                    
-                        torch.save(attention_masks_per_time_per_layer, os.path.join(out_path, f"attention_masks_t{i}.pt")) # this is huge!! 38 layes, 28 timesteps. Almost 50 GB
+
                 else:
                     # raise ValueError("Nah")
                     # not here
